@@ -1,141 +1,316 @@
+# ══════════════════════════════════════════════════════════════
+# Demonstrating step_unknown(), step_novel(), and step_other()
+# Using a controlled subset of the cars dataset
+# ══════════════════════════════════════════════════════════════
+#
+# KEY CONTEXT: Modern tidymodels (2024+) no longer crashes when
+# it encounters NAs or unseen factor levels. Instead, it WARNS
+# and handles things gracefully — but "gracefully" can mean
+# SILENTLY WRONG if you're not paying attention.
+#
+# This demo shows:
+#   1. What happens WITHOUT these steps (silent corruption)
+#   2. What each step does (incremental build)
+#   3. Why the ORDER of steps matters (tidymodels tells you!)
+# ══════════════════════════════════════════════════════════════
+
 library(tidyverse)
 library(tidymodels)
 
-# ── Load & split ──────────────────────────────────────────
 cars <- read_csv('https://www.dropbox.com/scl/fi/xavej23qpauvx3xfdq7zh/car_sales.csv?rlkey=4mfp6tpia0uqkcoiqf9jleau3&dl=1')
+
+# ── Build a controlled train / test split ─────────────────────
+#
+# We need a scenario where:
+#   (a) NAs exist → step_unknown() has something to fix
+#   (b) Some makes are rare → step_other() collapses them
+#   (c) A make appears in test that NEVER appeared in training
+#       → step_novel() catches it
+#   (d) The "missing" level is frequent enough to SURVIVE
+#       step_other(), so we can actually see it in the dummies
 
 set.seed(42)
 cars_split <- initial_split(cars, prop = 0.8)
 cars_training <- training(cars_split)
 cars_testing  <- testing(cars_split)
 
-# ── Quick look at why this matters ────────────────────────
-# How many NAs in make?
-cars_training |> summarize(
-  na_make = sum(is.na(make)), 
-  na_model = sum(is.na(model))
-  )
+set.seed(42)
 
-# How many unique makes, and how many are rare (< 5%)?
-cars_training |>
-  count(make, sort = TRUE) |>
-  mutate(pct = n / sum(n)) |>
-  summarize(
-    total_makes   = n(),
-    below_5_pct   = sum(pct < 0.05),
-    singletons    = sum(n <= 2)
-  )
+cars_train_demo <- bind_rows(
+  cars_training |> filter(make == "Ford")      |> slice_sample(n = 500),
+  cars_training |> filter(make == "Chevrolet") |> slice_sample(n = 400),
+  cars_training |> filter(make == "Toyota")    |> slice_sample(n = 200),
+  cars_training |> filter(make == "Nissan")    |> slice_sample(n = 50),   # rare
+  cars_training |> filter(make == "Dodge")     |> slice_sample(n = 30),   # rare
+  cars_training |> filter(is.na(make))         |> slice_sample(n = 80)    # NAs
+)
 
-# Which makes appear in test but NOT in training?
-test_makes  <- unique(cars_testing$make)
-train_makes <- unique(cars_training$make)
-setdiff( train_makes, test_makes)  # these are the "unseen" levels
+cars_test_demo <- bind_rows(
+  cars_testing |> filter(make == "Ford")      |> slice_sample(n = 120),
+  cars_testing |> filter(make == "Chevrolet") |> slice_sample(n = 100),
+  cars_testing |> filter(make == "Toyota")    |> slice_sample(n = 60),
+  cars_testing |> filter(make == "BMW")       |> slice_sample(n = 40),   # UNSEEN
+  cars_testing |> filter(is.na(make))         |> slice_sample(n = 25)    # NAs
+)
 
-# ═══════════════════════════════════════════════════════════
-# DEMO 1: step_unknown() — handling NAs in categorical cols
-# ═══════════════════════════════════════════════════════════
+# Quick check: what does each set look like?
+cars_train_demo |> count(make, sort = TRUE)
+# → Ford(500), Chev(400), Toyota(200), NA(80), Nissan(50), Dodge(30)
 
-# What happens if we just try step_dummy() on data with NAs?
-bad_rec <- recipe(sellingprice_log ~ make, data = cars_training) |>
+cars_test_demo |> count(make, sort = TRUE)
+# → Ford(120), Chev(100), Toyota(60), BMW(40), NA(25)
+
+# CRITICAL: BMW is NOT in training. NAs exist in both.
+
+
+# ══════════════════════════════════════════════════════════════
+# DEMO 1: What happens WITHOUT these steps?
+#         (Spoiler: no crash, but silent problems)
+# ══════════════════════════════════════════════════════════════
+
+# -- 1a: Bare step_dummy() on data with NAs --
+bare_rec <- recipe(sellingprice_log ~ make, data = cars_train_demo) |>
   step_dummy(make)
 
-# This will create weird dummy codes because make has NAs
-bad_rec |> prep() |> 
-  bake(cars_training) |> 
+bare_baked <- bare_rec |> prep() |> bake(cars_train_demo)
+# ⚠ WARNING: "There are new levels in `make`: NA"
+# ⚠ "Consider using step_unknown() before step_dummy()"
+
+# But wait — it didn't crash! Let's look at what it DID do:
+bare_baked |>
   select(starts_with("make_")) |>
-  glimpse()
+  summarize(across(everything(), \(x) sum(x, na.rm = TRUE)))
+# → The 80 NA rows get ALL-ZERO dummy columns.
+#   That means they're absorbed into the REFERENCE LEVEL (Chevrolet).
+#   Your model now thinks 80 cars with unknown make are Chevrolets. 😬
 
-# Fix: convert NAs to an explicit factor level first
-rec_unknown <- recipe(sellingprice_log ~ make, data = cars_training) |>
-  step_unknown(make, new_level = "missing") |>
-  step_dummy(make)
-
-
-# Look at the training result — NAs are now "missing"
-rec_unknown |> prep() |>
-  bake(cars_training) |>
+# How many rows have all-zero dummies? (= treated as reference level)
+bare_baked |>
   select(starts_with("make_")) |>
-  glimpse()
+  filter(if_all(everything(), ~ . == 0)) |>
+  nrow()
+# → 480 = 400 Chevrolets + 80 NAs. The NAs silently became Chevrolets.
 
-# Confirm: is there a make_missing column?
-rec_unknown_prepped |>
-  bake(cars_training) |>
-  select(make_missing) |>
-  summarize(has_missing = sum(make_missing))
 
-# ═══════════════════════════════════════════════════════════
-# DEMO 2: step_other() — collapsing rare categories
-# ═══════════════════════════════════════════════════════════
-
-rec_other <- recipe(sellingprice_log ~ make, data = cars_training) |>
+# -- 1b: With step_unknown() + step_other() but NO step_novel() --
+no_novel_rec <- recipe(sellingprice_log ~ make, data = cars_train_demo) |>
   step_unknown(make, new_level = "missing") |>
   step_other(make, threshold = 0.05) |>
   step_dummy(make)
 
-rec_other_prepped <- rec_other |> prep()
+no_novel_baked <- no_novel_rec |> prep() |> bake(cars_test_demo)
+# ⚠ WARNING: "There are new levels in `make`: BMW"
+# ⚠ "Consider using step_novel() before step_unknown()"
+# ⚠ "New levels will be coerced to NA by step_unknown()"
 
-# How many dummy columns now? Much fewer than 86!
-rec_other_prepped |>
-  bake(cars_training) |>
-  select(starts_with("make_"))
+# Again — no crash! But what happened to BMW?
+no_novel_baked |>
+  select(starts_with("make_")) |>
+  summarize(across(everything(), \(x) sum(x, na.rm = TRUE)))
+# → make_missing shows 25 (our actual NAs), but where are the 40 BMWs?
+#   BMW → coerced to NA → then step_unknown() converts NA to "missing"
+#   So BMW is now counted as "missing" alongside real NAs!
+#   You've lost the distinction between "I don't know the make" and
+#   "this is a brand I've never seen before." Not great.
 
-# ═══════════════════════════════════════════════════════════
-# DEMO 3: step_novel() — catching unseen levels at bake time
-# ═══════════════════════════════════════════════════════════
+# KEY LESSON: Modern tidymodels won't crash. But "no crash" ≠ "correct."
+# The data is silently corrupted. In production, this is WORSE than
+# a crash — at least a crash tells you something is wrong.
 
-# Without step_novel(), baking test data with unseen makes fails
-rec_no_novel <- recipe(sellingprice_log ~ make, data = cars_training) |>
+
+# ══════════════════════════════════════════════════════════════
+# DEMO 2: Build the recipe CORRECTLY — step by step
+# ══════════════════════════════════════════════════════════════
+
+# Step 0: Raw test data — our starting point
+cars_test_demo |>
+  count(make, sort = TRUE) |>
+  mutate(pct = scales::percent(n / sum(n)))
+# make          n pct
+# Ford        120 34.8%
+# Chevrolet   100 29.0%
+# Toyota       60 17.4%
+# BMW          40 11.6%    ← unseen in training
+# NA           25  7.2%    ← missing
+
+
+# ── STEP 1: step_novel() first ────────────────────────────────
+# WHY FIRST? Because we need to catch unseen levels BEFORE
+# step_unknown() turns them into NAs. Read the warnings above —
+# tidymodels literally tells you: "use step_novel() BEFORE
+# step_unknown()."
+
+rec_step1 <- recipe(sellingprice_log ~ make, data = cars_train_demo) |>
+  step_novel(make, new_level = "brand_new")
+
+rec_step1 |> prep() |> bake(cars_test_demo) |>
+  count(make, sort = TRUE) |>
+  mutate(pct = scales::percent(n / sum(n)))
+# → BMW becomes "brand_new" (40 rows)  ← step_novel caught it!
+# → NAs are still NA (25 rows)         ← not handled yet
+
+
+# ── STEP 2: step_novel() + step_unknown() ─────────────────────
+rec_step2 <- recipe(sellingprice_log ~ make, data = cars_train_demo) |>
+  step_novel(make, new_level = "brand_new") |>
+  step_unknown(make, new_level = "missing")
+
+rec_step2 |> prep() |> bake(cars_test_demo) |>
+  count(make, sort = TRUE) |>
+  mutate(pct = scales::percent(n / sum(n)))
+# → "brand_new" = 40 rows (BMW, caught by step_novel)
+# → "missing"   = 25 rows (NAs, caught by step_unknown)
+# → No warnings! Both problems explicitly handled.
+# COMPARE THIS to Demo 1b where BMW silently became "missing"
+
+
+# ── STEP 3: + step_other() ───────────────────────────────────
+rec_step3 <- recipe(sellingprice_log ~ make, data = cars_train_demo) |>
+  step_novel(make, new_level = "brand_new") |>
   step_unknown(make, new_level = "missing") |>
-  # step_other(make, threshold = 0.05) |>
+  step_other(make, threshold = 0.05)
+
+rec_step3 |> prep() |> bake(cars_test_demo) |>
+  count(make, sort = TRUE) |>
+  mutate(pct = scales::percent(n / sum(n)))
+# → Ford, Chevrolet, Toyota survive (each > 5% of training)
+# → "missing" SURVIVES (80/1260 = 6.3% of training > 5% threshold)
+# → Nissan (4.0%), Dodge (2.4%), "brand_new" (0%) → collapsed to "other"
+# → No warnings!
+
+
+# ── STEP 4: The full recipe with step_dummy() ────────────────
+rec_full <- recipe(sellingprice_log ~ make, data = cars_train_demo) |>
+  step_novel(make, new_level = "brand_new") |>
+  step_unknown(make, new_level = "missing") |>
+  step_other(make, threshold = 0.05) |>
   step_dummy(make)
 
-rec_no_novel_prepped <- rec_no_novel |> prep()
+rec_full_prepped <- rec_full |> prep()
 
-# This will warn or error because test has makes not in training
-rec_no_novel_prepped |> bake(cars_testing)  # uncomment to see
+# What dummy columns did we get?
+rec_full_prepped |>
+  bake(cars_test_demo) |>
+  select(starts_with("make_"))  
+# → make_Ford, make_Toyota, make_missing, make_other
+#   (Chevrolet is the reference level — gets all zeros)
 
-# Fix: add step_novel() between unknown and other
-rec_novel <- recipe(sellingprice_log ~ make, data = cars_training) |>
+# Count how many test rows land in each bucket
+rec_full_prepped |>
+  bake(cars_test_demo) |>
+  select(starts_with("make_")) |>
+  summarize(across(everything(), sum))
+# → make_Ford = 120, make_Toyota = 60, make_missing = 25, make_other = 40
+# → The 40 BMW rows land cleanly in "other" via brand_new → other
+# → The 25 NA rows are explicitly "missing" — a real signal!
+# → No warnings, no silent corruption. Everything is explicit.
+
+
+# ══════════════════════════════════════════════════════════════
+# DEMO 3: The ordering matters — wrong vs. right
+# ══════════════════════════════════════════════════════════════
+
+# ❌ WRONG ORDER: step_unknown() before step_novel()
+rec_wrong_order <- recipe(sellingprice_log ~ make, data = cars_train_demo) |>
   step_unknown(make, new_level = "missing") |>
   step_novel(make, new_level = "brand_new") |>
   step_other(make, threshold = 0.05) |>
   step_dummy(make)
 
-rec_novel_prepped <- rec_novel |> prep()
+wrong_baked <- rec_wrong_order |> prep() |> bake(cars_test_demo)
+# ⚠ WARNING: new levels in make: BMW — coerced to NA by step_unknown()
+# BMW → NA → "missing" ... lumped with real NAs. step_novel never fires.
 
-# Now baking test data works — unseen makes become "brand_new"
-rec_novel_prepped |>
-  bake(cars_testing) |>
+wrong_baked |>
   select(starts_with("make_")) |>
-  glimpse()
+  summarize(across(everything(), sum))
+# → make_missing = 65 (25 real NAs + 40 BMWs all mixed together)
+# → make_other = 0   (no one ended up here!)
+# You can't tell a missing value from an unseen brand. Bad.
 
-# Check: any rows mapped to brand_new?
-rec_novel_prepped |>
-  bake(cars_testing) |>
-  select(make_brand.new) |>
-  summarize(n_brand_new = sum(make_brand.new))
 
-# ═══════════════════════════════════════════════════════════
-# DEMO 4: The full recommended recipe
-# ═══════════════════════════════════════════════════════════
+# ✅ RIGHT ORDER: step_novel() before step_unknown()
+rec_right_order <- recipe(sellingprice_log ~ make, data = cars_train_demo) |>
+  step_novel(make, new_level = "brand_new") |>
+  step_unknown(make, new_level = "missing") |>
+  step_other(make, threshold = 0.05) |>
+  step_dummy(make)
 
-cars_rec <- recipe(sellingprice_log ~ ., data = cars_training) |>
-  step_impute_median(all_numeric_predictors()) |>
-  step_YeoJohnson(all_numeric_predictors()) |>
-  step_unknown(c(make, model), new_level = "missing") |>    # 1. NA → level
-  step_novel(c(make, model), new_level = "brand_new") |>    # 2. safety net
-  step_other(c(make, model), threshold = 0.05) |>           # 3. rare → other
-  step_normalize(all_numeric_predictors()) |>
-  step_dummy(all_nominal_predictors())                        # 4. encode
+right_baked <- rec_right_order |> prep() |> bake(cars_test_demo)
+# → No warnings! Everything handled cleanly.
 
-cars_prepped <- cars_rec |> prep()
+right_baked |>
+  select(starts_with("make_")) |>
+  summarize(across(everything(), sum))
+# → make_missing = 25 (real NAs only)
+# → make_other = 40   (BMWs, via brand_new → other)
+# Clean separation. You know exactly what went where.
 
-# Bake training — should work cleanly
-cars_prepped |>
-  bake(cars_training) |>
-  glimpse()
 
-# Bake testing — works even with unseen makes/models
-cars_prepped |>
-  bake(cars_testing) |>
-  glimpse()
+# ══════════════════════════════════════════════════════════════
+# DEMO 4: Side-by-side comparison — why this matters for models
+# ══════════════════════════════════════════════════════════════
+
+# Let's see the actual difference row by row
+comparison <- tibble(
+  original_make = cars_test_demo$make,
+  wrong_order = wrong_baked |>
+    select(starts_with("make_")) |>
+    mutate(bucket = case_when(
+      make_Ford == 1    ~ "Ford",
+      make_Toyota == 1  ~ "Toyota",
+      make_missing == 1 ~ "missing",
+      make_other == 1   ~ "other",
+      TRUE              ~ "Chevrolet (ref)"
+    )) |> pull(bucket),
+  right_order = right_baked |>
+    select(starts_with("make_")) |>
+    mutate(bucket = case_when(
+      make_Ford == 1    ~ "Ford",
+      make_Toyota == 1  ~ "Toyota",
+      make_missing == 1 ~ "missing",
+      make_other == 1   ~ "other",
+      TRUE              ~ "Chevrolet (ref)"
+    )) |> pull(bucket)
+)
+
+comparison
+
+# Where do they disagree?
+comparison |>
+  filter(wrong_order != right_order) |>
+  count(original_make, wrong_order, right_order)
+# → 40 BMW rows: wrong_order puts them in "missing",
+#                 right_order puts them in "other"
+# That's a material difference for your model!
+
+
+# ══════════════════════════════════════════════════════════════
+# SUMMARY: The correct recipe order (and why)
+# ══════════════════════════════════════════════════════════════
+#
+#   1. step_novel()     unseen → "brand_new"   (catch new categories FIRST)
+#   2. step_unknown()   NA → "missing"         (then handle NAs)
+#   3. step_other()     rare → "other"         (collapse infrequent levels)
+#   4. step_dummy()     factors → 0/1 columns  (numeric encoding)
+#
+# WHY THIS ORDER:
+#   - step_novel() must come first so unseen levels don't get
+#     silently coerced to NA by step_unknown()
+#   - step_unknown() must come before step_dummy() so NAs get
+#     an explicit level instead of all-zero dummies
+#   - step_other() reduces dimensionality before dummifying
+#   - step_dummy() goes last to create the numeric representation
+#
+# THE BIG TAKEAWAY:
+#   Modern tidymodels won't crash on NAs or unseen levels.
+#   It warns and handles them — but "handles" often means
+#   "silently converts to NA" or "absorbs into the reference level."
+#
+#   Using these three steps in the right order gives you EXPLICIT
+#   CONTROL over where every row ends up. No surprises in production.
+#
+# Think of it this way:
+#   step_novel()   = handling unknown unknowns (new brands at inference)
+#   step_unknown() = handling known unknowns   (we know NAs exist)
+#   step_other()   = keeping the model lean    (too many small categories)
